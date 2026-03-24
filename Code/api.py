@@ -1,76 +1,167 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-import pandas as pd
+from pathlib import Path
+import json
+
+import joblib
+import mlflow
 import mlflow.sklearn
-import os
+import pandas as pd
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
+from typing import Literal
 
-app = FastAPI(title="Churn Prediction API")
 
-# 1. Configuration de l'accès dynamique à MLflow [cite: 89, 435]
-# On utilise l'alias 'Production' qui est géré par ton script de promotion automatique.
-MODEL_NAME = "Churn_Classifier"
-MODEL_ALIAS = "production" 
-try:
-    # On charge le modèle via l'URI utilisant l'alias @Production [cite: 136]
-    model_uri = f"models:/{MODEL_NAME}@{MODEL_ALIAS}"
-    model = mlflow.sklearn.load_model(model_uri)
-    print(f"✅ Modèle {MODEL_NAME} (Alias: {MODEL_ALIAS}) chargé avec succès.")
-except Exception as e:
-    print(f"❌ Erreur critique lors du chargement depuis MLflow Registry : {e}")
-    # Indispensable pour la gestion des erreurs lors de l'industrialisation 
-    model = None
+# =========================================================
+# Configuration
+# =========================================================
+BASE_DIR = Path(__file__).resolve().parent.parent
+ARTIFACTS_DIR = BASE_DIR / "artifacts"
+MLFLOW_DB = (BASE_DIR / "mlflow.db").as_posix()
 
-# 2. Définition complète du format de données (EF5) [cite: 95, 211, 441]
-# Note : Toutes les colonnes utilisées par le pipeline de preprocessing doivent être ici.
+MODEL_URI = "models:/Churn_Classifier@production"
+LOCAL_MODEL_PATH = ARTIFACTS_DIR / "best_model.joblib"
+CONFIG_PATH = ARTIFACTS_DIR / "model_config.json"
+
+mlflow.set_tracking_uri(f"sqlite:///{MLFLOW_DB}")
+
+app = FastAPI(
+    title="Churn Prediction API",
+    description="API de prédiction du churn client",
+    version="1.0.0"
+)
+
+model = None
+model_source = None
+model_config = None
+
+
+# =========================================================
+# Schéma des données
+# =========================================================
 class CustomerData(BaseModel):
-    gender: str
-    age: int
-    tenure_months: int
-    contract_type: str
-    monthly_logins: int
-    weekly_active_days: int
-    avg_session_time: float
-    monthly_fee: float
-    payment_failures: int
-    nps_score: int
-    # Ajoute ici les colonnes restantes si ton dataset en contient d'autres (ex: 'total_revenue')
+    gender: Literal["Male", "Female"]
+    age: int = Field(..., ge=18, le=100)
+    tenure_months: int = Field(..., ge=0)
+    contract_type: Literal["Monthly", "Quarterly", "Yearly"]
+    monthly_logins: int = Field(..., ge=0)
+    weekly_active_days: int = Field(..., ge=0, le=7)
+    avg_session_time: float = Field(..., ge=0)
+    monthly_fee: float = Field(..., ge=0)
+    payment_failures: int = Field(..., ge=0)
+    nps_score: int = Field(..., ge=-100, le=100)
+
+
+# =========================================================
+# Chargement modèle + config
+# =========================================================
+def load_config():
+    if not CONFIG_PATH.exists():
+        raise FileNotFoundError(f"Fichier config introuvable : {CONFIG_PATH}")
+
+    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def load_model():
+    global model, model_source, model_config
+
+    model_config = load_config()
+
+    # 1) on essaie MLflow
+    try:
+        model = mlflow.sklearn.load_model(MODEL_URI)
+        model_source = "mlflow"
+        print("Modèle chargé depuis MLflow.")
+        return
+    except Exception as e:
+        print(f"Chargement MLflow impossible : {e}")
+
+    # 2) fallback local
+    if LOCAL_MODEL_PATH.exists():
+        model = joblib.load(LOCAL_MODEL_PATH)
+        model_source = "joblib"
+        print("Modèle chargé depuis le fichier local best_model.joblib.")
+        return
+
+    raise RuntimeError("Impossible de charger le modèle depuis MLflow ou joblib.")
+
+
+@app.on_event("startup")
+def startup_event():
+    load_model()
+
+
+# =========================================================
+# Routes
+# =========================================================
+@app.get("/")
+def home():
+    return {
+        "message": "API de prédiction du churn client",
+        "endpoints": ["/health", "/model-info", "/predict"]
+    }
+
 
 @app.get("/health")
-def health_check():
-    """Vérifie que le service et le modèle sont opérationnels [cite: 96, 443]"""
+def health():
     if model is None:
-        raise HTTPException(status_code=503, detail="Modèle non chargé")
+        raise HTTPException(status_code=500, detail="Modèle non chargé")
+
     return {
-        "status": "healthy", 
-        "model_source": "MLflow Registry",
-        "model_name": MODEL_NAME,
-        "alias": MODEL_ALIAS
+        "status": "ok",
+        "model_loaded": True,
+        "model_source": model_source
     }
+
+
+@app.get("/model-info")
+def get_model_info():
+    if model_config is None:
+        raise HTTPException(status_code=500, detail="Configuration du modèle non chargée")
+
+    return {
+        "model_name": model_config.get("model_name"),
+        "threshold": model_config.get("threshold"),
+        "features": model_config.get("features"),
+        "target": model_config.get("target"),
+        "model_source": model_source
+    }
+
 
 @app.post("/predict")
 def predict(data: CustomerData):
-    """Reçoit un JSON et renvoie la probabilité de churn [cite: 95, 441]"""
     if model is None:
-        raise HTTPException(status_code=503, detail="Modèle non disponible")
-        
+        raise HTTPException(status_code=500, detail="Modèle non chargé")
+
     try:
-        # Conversion du JSON en DataFrame pour le pipeline [cite: 101, 435]
-        df_input = pd.DataFrame([data.dict()])
-        
-        # Inférence (le pipeline MLflow gère le scaling et l'encodage automatiquement) [cite: 130, 435]
-        probability = model.predict_proba(df_input)[0][1]
-        
-        # Seuil de décision métier ajusté pour maximiser le Recall [cite: 308, 345]
-        # Dans un contexte de churn, on préfère alerter à partir de 30% de probabilité.
-        threshold = 0.3 
-        prediction = 1 if probability >= threshold else 0
-        
+        input_dict = data.model_dump()
+    except AttributeError:
+        input_dict = data.dict()
+
+    try:
+        features = model_config["features"]
+        threshold = float(model_config.get("threshold", 0.5))
+
+        df = pd.DataFrame([input_dict])
+
+        # on remet les colonnes dans le bon ordre
+        df = df[features]
+
+        proba = float(model.predict_proba(df)[0][1])
+        prediction = int(proba >= threshold)
+
+        if prediction == 1:
+            risk_level = "élevé" if proba >= 0.70 else "modéré"
+        else:
+            risk_level = "faible"
+
         return {
             "prediction": prediction,
-            "churn_probability": round(float(probability), 4),
-            "applied_threshold": threshold,
-            "status": "success"
+            "churn_probability": round(proba, 4),
+            "threshold_used": threshold,
+            "risk_level": risk_level,
+            "model_name": model_config.get("model_name"),
+            "model_source": model_source
         }
+
     except Exception as e:
-        # Gestion rigoureuse des erreurs pour l'industrialisation 
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=400, detail=f"Erreur lors de la prédiction : {str(e)}")
