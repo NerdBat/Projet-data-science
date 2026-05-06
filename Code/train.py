@@ -34,10 +34,6 @@ from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 warnings.filterwarnings("ignore", category=UndefinedMetricWarning)
 
-
-# =========================================================
-# Configuration
-# =========================================================
 RANDOM_STATE = 42
 TEST_SIZE = 0.2
 CV_SPLITS = 5
@@ -71,15 +67,8 @@ mlflow.set_tracking_uri(f"sqlite:///{MLFLOW_DB}")
 mlflow.set_experiment(EXPERIMENT_NAME)
 client = MlflowClient()
 
-
-# =========================================================
-# Fonctions utiles
-# =========================================================
+# Donne le meilleur seuil avec le F2-score
 def choose_best_threshold(y_true, y_proba):
-    """
-    Choisit le meilleur seuil avec le F2-score
-    (on donne plus d'importance au recall).
-    """
     best_threshold = 0.5
     best_f2 = -1
 
@@ -93,7 +82,7 @@ def choose_best_threshold(y_true, y_proba):
 
     return best_threshold
 
-
+#
 def build_pipeline(model, numeric_features, categorical_features):
     numeric_transformer = Pipeline([
         ("imputer", SimpleImputer(strategy="median")),
@@ -117,11 +106,8 @@ def build_pipeline(model, numeric_features, categorical_features):
 
     return pipeline
 
-
+# Attendree la fin de MLFLOW
 def wait_until_ready(model_name, version, timeout=30):
-    """
-    Attend un peu que MLflow finisse l'enregistrement.
-    """
     start = time.time()
     while time.time() - start < timeout:
         mv = client.get_model_version(model_name, version)
@@ -130,9 +116,7 @@ def wait_until_ready(model_name, version, timeout=30):
         time.sleep(1)
 
 
-# =========================================================
-# Chargement des données
-# =========================================================
+#Chargement des données
 df = pd.read_csv(DATA_PATH)
 
 missing_cols = [col for col in FEATURES + [TARGET] if col not in df.columns]
@@ -156,10 +140,7 @@ X_train, X_test, y_train, y_test = train_test_split(
 print(f"Train : {X_train.shape} | Test : {X_test.shape}")
 print(f"Taux de churn : {y.mean():.2%}")
 
-
-# =========================================================
-# Modèles à comparer
-# =========================================================
+# ON range nos modèles dans un object pour pouvoir les comparer par la suite 
 models = {
     "Logistic Regression": LogisticRegression(
         max_iter=1000,
@@ -196,9 +177,7 @@ results = []
 trained_pipelines = {}
 best_thresholds = {}
 
-# =========================================================
-# Entraînement + CV + seuil + logs MLflow
-# =========================================================
+# Entrainement validation croisée et seuils ( logs mlflow)
 for model_name, model in models.items():
     print(f"\n===== {model_name} =====")
 
@@ -271,9 +250,7 @@ for model_name, model in models.items():
         print(f"Test F1    : {metrics['test_f1']:.4f}")
 
 
-# =========================================================
-# Choix du meilleur modèle
-# =========================================================
+# Séléction du meilleur modèle 
 results_df = pd.DataFrame(results).sort_values(
     by=["cv_pr_auc_mean", "cv_recall_mean", "cv_roc_auc_mean"],
     ascending=False,
@@ -297,9 +274,7 @@ print("\nMatrice de confusion :")
 print(confusion_matrix(y_test, best_y_pred))
 
 
-# =========================================================
-# Sauvegarde locale
-# =========================================================
+#Sauvegarde Locale
 joblib.dump(best_pipeline, ARTIFACTS_DIR / "best_model.joblib")
 results_df.to_csv(ARTIFACTS_DIR / "model_metrics.csv", index=False)
 
@@ -318,10 +293,7 @@ pred_df["y_proba"] = best_y_proba
 pred_df["y_pred"] = best_y_pred
 pred_df.to_csv(ARTIFACTS_DIR / "test_predictions.csv", index=False)
 
-# =========================================================
-# Enregistrement du meilleur modèle dans MLflow Registry
-# + alias "production"
-# =========================================================
+# Enregistrement du meilleur modèle et ajout dans la prod mlflow
 
 classifier = best_pipeline.named_steps["classifier"]
 preprocessor_fitted = best_pipeline.named_steps["preprocessor"]
